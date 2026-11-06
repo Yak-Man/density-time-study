@@ -1,0 +1,1044 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Density Over Time</title>
+<style>
+  html,body{margin:0;background:#0b0c0f;color:#c9ccd3;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;}
+  #bar{padding:10px 14px;font-size:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;border-bottom:1px solid #1d2028;}
+  #bar button,#bar label.btn{background:#171a21;color:#ddd;border:1px solid #2c303a;padding:5px 9px;font:inherit;cursor:pointer;}
+  #bar input[type=file]{display:none;}
+  #bar select{background:#171a21;color:#ddd;border:1px solid #2c303a;padding:4px 6px;font:inherit;}
+  #status{color:#8b91a0;}
+  #out{display:block;max-width:100%;height:auto;margin:0 auto;}
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="bar">
+  <b>Density over time</b>
+  <span id="status">computing…</span>
+  <label class="btn">Load a sound file…<input id="file" type="file" accept="audio/*"></label>
+  <label>Sphere <select id="sphereMode">
+    <option value="air">open air</option>
+    <option value="res">resonant shell</option>
+    <option value="acc">accretion (open air)</option>
+    <option value="accres">accretion + resonant shell</option>
+  </select></label>
+  <button data-xyz="col">Export points: column (.xyz)</button>
+  <button data-xyz="sph">Export points: sphere (.xyz)</button>
+</div>
+<canvas id="out"></canvas>
+<script type="module">
+import * as THREE from 'three';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+/* ============================================================
+   WHAT THIS IS
+   The density grid, given a time axis. As in density-grid-prototype:
+   a uniform medium of particles, each pushed up the pressure gradient,
+   so particles crowd into compressions and leave rarefactions empty.
+   The density pattern is emergent, not painted on.
+
+   What changes is what the field IS. Instead of one steady resonance,
+   each moment of a sound clip contributes its own field, laid out along
+   a time axis, so the whole clip is one object:
+
+   COLUMN  vertical = time (bottom = start). Every horizontal slice is
+           the real pressure field around the sources at that moment,
+           at real wavelengths (the slice is 3 m of air).
+   SPHERE  radius = time, as in propagation (outer = start, centre =
+           end). Every shell is the real far-field pattern the sources
+           threw in each direction at that moment.
+
+   Physics kept exact: wavelengths, source spacing, interference,
+   loudness (dB) and timing. Two presentational choices, said plainly:
+   - Stroboscopic: every partial is frozen at the same phase, as if lit
+     by a strobe, so a steady note makes a steady shape. (At any honest
+     time scale a 440 Hz wave cycles 1,760 times in 4 s; no print can
+     hold that.)
+   - Exaggerated amplitude: displacement is far larger than real air
+     moves, enough that particles fold into sheets (contrast > 1).
+   Along the time axis particles never move: that axis is time, not
+   space, and moving them along it would smear neighbouring moments.
+
+   Cleaning up the static (presentational, applied after the physics):
+   the spectrum is smoothed over ~0.1 s before partials are picked;
+   brightness is the pressure averaged over the particles that ended up
+   within ~0.4 mm, cut off moment by moment and scaled by loudness; and
+   engraving uses a soft threshold plus removal of isolated points.
+   Units are millimetres.
+   ============================================================ */
+const status = document.getElementById('status');
+const say = (t) => { status.textContent = t; };
+const tick = () => new Promise(r => setTimeout(r, 0));
+const P = new URLSearchParams(location.search);
+
+/* ---------------- the sound ---------------- */
+function synthClip(){
+  const SR = 32000, NS = SR*4, x = new Float32Array(NS); let ph = 0;
+  const notes = [[0.6,1.2,261.63],[1.2,1.8,329.63],[1.8,2.4,392.0],[2.4,3.0,523.25]];
+  for (let n=0;n<NS;n++){
+    const t = n/SR; let v = 0;
+    if (t >= 0.25 && t < 0.8){ const u = t-0.25; ph += 2*Math.PI*(50 + 70*Math.exp(-u*20))/SR; v += 0.9*Math.sin(ph)*Math.exp(-u/0.15); }
+    const tone = (f0, a, b) => { if (t < a || t >= b) return 0; const env = Math.min(1,(t-a)/0.02)*Math.min(1,(b-t)/0.08);
+      return env*0.3*(Math.sin(2*Math.PI*f0*t) + 0.5*Math.sin(4*Math.PI*f0*t) + 0.25*Math.sin(6*Math.PI*f0*t)); };
+    for (const [a,b,f] of notes) v += tone(f,a,b);
+    for (const f of [261.63,329.63,392.0,523.25]) v += 0.7*tone(f,3.0,3.9);
+    x[n] = v;
+  }
+  return { x, sr: SR, name: 'test phrase: kick, C E G C, chord' };
+}
+
+/* ---------------- analysis: loudness + strongest partials per moment ---------------- */
+function fft(re, im){
+  const n = re.length;
+  for (let i=1, j=0; i<n; i++){ let bit = n>>1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit;
+    if (i < j){ let t=re[i]; re[i]=re[j]; re[j]=t; t=im[i]; im[i]=im[j]; im[j]=t; } }
+  for (let len=2; len<=n; len<<=1){
+    const ang = -2*Math.PI/len, wr = Math.cos(ang), wi = Math.sin(ang), half = len>>1;
+    for (let i=0;i<n;i+=len){ let cr=1, ci=0;
+      for (let k=0;k<half;k++){ const a=i+k, b=a+half; const br=re[b]*cr-im[b]*ci, bi=re[b]*ci+im[b]*cr;
+        re[b]=re[a]-br; im[b]=im[a]-bi; re[a]+=br; im[a]+=bi; const t=cr*wr-ci*wi; ci=cr*wi+ci*wr; cr=t; } }
+  }
+}
+const K = 8, DR_DB = 40, PEAK_DB = 30, SMOOTH = 4;
+/* aopt (all optional) -- for dense mixes:
+     hpss  split percussive from harmonic (median filtering of the
+           spectrogram): partials come from the harmonic part only, onsets
+           from the percussive part. A full band's eight strongest partials
+           are mostly unrelated instruments; together they draw speckle.
+     seg   one shape per beat: cut the clip at its onsets (>= 0.18 s apart)
+           and give every segment the partials of its AVERAGED spectrum, so
+           each beat is one steady layer and repeated chords repeat shapes.
+     dyn   loudness range from this clip (10th..99th percentile of its dB
+           levels) instead of a fixed 40 dB, so a compressed master still
+           has quiet moments that recede.
+     maxNT moments analysed (default 600; more for a whole song) */
+function analyse(clip, aopt = {}){
+  const { x, sr } = clip;
+  const T = x.length/sr, NT = Math.min(aopt.maxNT || 600, Math.max(64, Math.round(T*100)));
+  const N = 4096, binHz = sr/N, re = new Float64Array(N), im = new Float64Array(N);
+  const kLo = Math.max(2, Math.ceil(30/binHz)), kHi = Math.min(N/2-2, Math.floor(5000/binHz)), NB = kHi + 2;
+  const M = new Float32Array(NT*NB);
+  for (let i=0;i<NT;i++){
+    const off = Math.round((i+0.5)/NT*x.length) - N/2;
+    for (let k=0;k<N;k++){ const j = off+k; re[k] = (j>=0 && j<x.length ? x[j] : 0)*(0.5-0.5*Math.cos(2*Math.PI*k/(N-1))); im[k] = 0; }
+    fft(re, im);
+    for (let k=0;k<NB;k++) M[i*NB+k] = Math.hypot(re[k], im[k]);
+  }
+  let MH = M, MP = M;
+  if (aopt.hpss){
+    /* harmonic = median across time (steady lines), percussive = median
+       across frequency (broadband clicks); soft (Wiener) masks */
+    const HW = 8, Hm = new Float32Array(NT*NB), Pm = new Float32Array(NT*NB), buf = [];
+    const med = (arr) => { arr.sort((a,b) => a-b); return arr[arr.length >> 1]; };
+    for (let i=0;i<NT;i++) for (let k=0;k<NB;k++){
+      buf.length = 0; for (let j=Math.max(0,i-HW); j<=Math.min(NT-1,i+HW); j++) buf.push(M[j*NB+k]); Hm[i*NB+k] = med(buf);
+      buf.length = 0; for (let j=Math.max(0,k-HW); j<=Math.min(NB-1,k+HW); j++) buf.push(M[i*NB+j]); Pm[i*NB+k] = med(buf);
+    }
+    MH = new Float32Array(NT*NB); MP = new Float32Array(NT*NB);
+    for (let q=0;q<NT*NB;q++){ const h2 = Hm[q]*Hm[q], p2 = Pm[q]*Pm[q], s = h2 + p2 || 1; MH[q] = M[q]*h2/s; MP[q] = M[q]*p2/s; }
+  }
+  /* Onsets: rise in loudness (dB scale) from the UNsmoothed spectrum (the
+     percussive part with hpss), so attacks stay sharp; held ~60 ms, 0..1. */
+  const ONraw = new Float32Array(NT), ON = new Float32Array(NT), Lr = new Float32Array(NT); let rmax = 0;
+  for (let i=0;i<NT;i++){ let s = 0; for (let k=kLo;k<=kHi;k++){ const m = MP[i*NB+k]; s += m*m; } Lr[i] = s; rmax = Math.max(rmax, s); }
+  for (let i=0;i<NT;i++) Lr[i] = Lr[i] > 0 ? Math.max(0, 1 + 10*Math.log10(Lr[i]/rmax)/DR_DB) : 0;
+  const dt = T/NT, hold = Math.exp(-dt/0.06); let omax = 0;
+  for (let i=0;i<NT;i++){ ONraw[i] = Math.max(0, Lr[i] - Lr[Math.max(0, i-3)]); ON[i] = Math.max(ONraw[i], i ? ON[i-1]*hold : 0); omax = Math.max(omax, ON[i]); }
+  for (let i=0;i<NT;i++) ON[i] = omax > 0 ? ON[i]/omax : 0;
+
+  /* Smooth the spectrum over neighbouring moments (power, Hann-weighted,
+     +-SMOOTH frames) before picking partials. Picked frame by frame, the
+     strongest partials swap places from one moment to the next, and every
+     swap changes the pattern -- which read as static along the time axis. */
+  const S = new Float32Array(NT*NB), wts = [];
+  for (let j=-SMOOTH;j<=SMOOTH;j++) wts.push(0.5 + 0.5*Math.cos(Math.PI*j/(SMOOTH+1)));
+  for (let i=0;i<NT;i++){
+    let wsum = 0;
+    for (let j=-SMOOTH;j<=SMOOTH;j++){ const ii = i+j; if (ii < 0 || ii >= NT) continue; wsum += wts[j+SMOOTH]; }
+    for (let k=0;k<NB;k++){ let v = 0;
+      for (let j=-SMOOTH;j<=SMOOTH;j++){ const ii = i+j; if (ii < 0 || ii >= NT) continue; const m = MH[ii*NB+k]; v += wts[j+SMOOTH]*m*m; }
+      S[i*NB+k] = Math.sqrt(v/wsum); }
+  }
+  // segments: onset peaks at least 0.18 s apart
+  let SEG = null;
+  if (aopt.seg){
+    const gap = Math.max(1, Math.round(0.18/dt)), thr = 0.12*Math.max(...ONraw), starts = [0];
+    for (let i=1;i<NT-1;i++) if (ONraw[i] > thr && ONraw[i] >= ONraw[i-1] && ONraw[i] >= ONraw[i+1] && i - starts[starts.length-1] >= gap) starts.push(i);
+    SEG = new Int32Array(NT); for (let s=0; s<starts.length; s++) for (let i=starts[s]; i<(starts[s+1] ?? NT); i++) SEG[i] = s;
+    const segAvg = new Float32Array(starts.length*NB), cnt = new Float32Array(starts.length);
+    for (let i=0;i<NT;i++){ cnt[SEG[i]]++; for (let k=0;k<NB;k++){ const m = MH[i*NB+k]; segAvg[SEG[i]*NB+k] += m*m; } }
+    for (let i=0;i<NT;i++) for (let k=0;k<NB;k++) S[i*NB+k] = Math.sqrt(segAvg[SEG[i]*NB+k]/cnt[SEG[i]]);
+  }
+  const pw = new Float64Array(NT), F = new Float32Array(NT*K), W = new Float32Array(NT*K), L = new Float32Array(NT);
+  let pmax = 0;
+  for (let i=0;i<NT;i++){
+    const mag = S.subarray(i*NB, (i+1)*NB);
+    let m = 0; for (let k=kLo;k<=kHi;k++) m = Math.max(m, mag[k]);
+    // loudness from the whole mix, smoothed like the spectrum (identical to before when no option is on)
+    let s = 0, wsum = 0;
+    for (let j=-SMOOTH;j<=SMOOTH;j++){ const ii = i+j; if (ii < 0 || ii >= NT) continue; let e = 0; for (let k=kLo;k<=kHi;k++){ const v = M[ii*NB+k]; e += v*v; } s += wts[j+SMOOTH]*e; wsum += wts[j+SMOOTH]; }
+    s /= wsum;
+    pw[i] = s; pmax = Math.max(pmax, s);
+    const floor = m*Math.pow(10, -PEAK_DB/20), cand = [];
+    for (let k=kLo;k<=kHi;k++) if (mag[k] > floor && mag[k] > mag[k-1] && mag[k] >= mag[k+1]) cand.push(k);
+    cand.sort((a,b) => mag[b]-mag[a]);
+    let ws = 0;
+    for (let c=0;c<Math.min(K,cand.length);c++){
+      const k = cand[c], a = Math.log(mag[k-1]+1e-12), b = Math.log(mag[k]+1e-12), g = Math.log(mag[k+1]+1e-12);
+      const den = a - 2*b + g, d = den !== 0 ? 0.5*(a-g)/den : 0;
+      F[i*K+c] = (k + d)*binHz;
+      /* Partials are weighted by amplitude^0.6, not linearly: linearly, a
+         fundamental swallows its own overtones (the recurring "loudest
+         term swallows detail" failure). Presentational, not physical. */
+      W[i*K+c] = Math.pow(Math.exp(b - 0.25*(a-g)*d), 0.6); ws += W[i*K+c];
+    }
+    for (let c=0;c<K;c++) W[i*K+c] = ws > 0 ? W[i*K+c]/ws : 0;
+  }
+  const db = Array.from(pw, (v, i) => v > 0 ? 10*Math.log10(v/pmax) : -120);
+  if (aopt.dyn){
+    const sorted = db.filter(v => v > -119).sort((a,b) => a-b), pct = (q) => sorted[Math.min(sorted.length-1, Math.floor(q*sorted.length))] ?? 0;
+    const lo = pct(0.10), hi = pct(0.99);
+    for (let i=0;i<NT;i++) L[i] = Math.max(0, Math.min(1, (db[i] - lo)/Math.max(hi - lo, 3)));
+  } else for (let i=0;i<NT;i++) L[i] = Math.max(0, Math.min(1, 1 + db[i]/DR_DB));
+  return { T, NT, F, W, L, ON, SEG, ...stereoImage(clip, NT) };
+}
+/* Stereo image per moment, if the clip has two channels: pan -1..1
+   (left..right, from channel energies) and width 0..1 (1 - |correlation|). */
+function stereoImage(clip, NT){
+  const { xL, xR } = clip; if (!xL || !xR) return {};
+  const PAN = new Float32Array(NT), WID = new Float32Array(NT), H = Math.floor(xL.length/NT);
+  for (let i=0;i<NT;i++){
+    const c = Math.round((i+0.5)/NT*xL.length); let ll = 0, rr = 0, lr = 0;
+    for (let j=Math.max(0, c-H); j<Math.min(xL.length, c+H); j++){ ll += xL[j]*xL[j]; rr += xR[j]*xR[j]; lr += xL[j]*xR[j]; }
+    PAN[i] = ll + rr > 0 ? (rr - ll)/(rr + ll) : 0; WID[i] = ll > 0 && rr > 0 ? 1 - Math.abs(lr)/Math.sqrt(ll*rr) : 0;
+  }
+  return { PAN, WID };
+}
+
+function rng(seed){ let a = seed >>> 0; return () => (a = (a*1664525 + 1013904223) >>> 0)/4294967296; }
+
+/* ---------------- what radiated it (metres, horizontal x/z plane) ---------------- */
+const NSRC = +(P.get('ns') || 7);
+const PRESETS = {
+  ring:    { label: 'ring of 8 sources, 1 m across', src: Array.from({length:8}, (_,i) => [0.5*Math.cos(i*Math.PI/4), 0, 0.5*Math.sin(i*Math.PI/4)]) },
+  pair:    { label: 'two sources 0.75 m apart', src: [[-0.375,0,0],[0.375,0,0]] },
+  cluster: { label: 'irregular cluster of 6 sources', src: [[0.31,0.05,0.02],[-0.12,-0.08,0.27],[-0.25,0.1,-0.16],[0.06,-0.04,-0.33],[0.18,0.12,0.22],[-0.33,-0.02,0.08]] },
+  /* 12 drivers at the face centres of a dodecahedron (= icosahedron
+     vertices): the layout of the omnidirectional loudspeakers used in
+     acoustic testing. Its spread is the same in every direction, so low
+     notes radiate evenly -- no permanent beam -- and higher ones break
+     into lobes with the solid's symmetry. Radius 1 m. */
+  dodeca: { label: '12-driver dodecahedral source, 2 m across', src: (() => { const g = (1 + Math.sqrt(5))/2, o = [];
+    for (const a of [-1, 1]) for (const b of [-g, g]) o.push([0, a, b], [a, b, 0], [b, 0, a]);
+    return o.map(v => { const l = Math.hypot(...v); return v.map(c => c/l); }); })() },
+  /* A flat group beams broadside: every source is equidistant along the
+     normal, so that direction is always in phase and draws a permanent
+     bright axis. Spread the sources in all three dimensions instead. */
+  cloud3d: { label: NSRC + ' sources scattered through 2 m', src: (() => { const r = rng(2024), o = [];
+    while (o.length < NSRC){ const v = [r()*2-1, r()*2-1, r()*2-1]; if (Math.hypot(...v) < 1 && Math.hypot(...v) > 0.35) o.push(v); }
+    return o; })() }
+};
+const PRESET = PRESETS[P.get('src')] ? P.get('src') : 'dodeca';
+const SSCALE = +(P.get('scale') || 1);
+const SRC = PRESETS[PRESET].src.map(v => (P.get('perm') ? [v[1], v[2], v[0]] : v).map(c => c*SSCALE));
+const GAIN = +(P.get('gain') || 1.25);         // density contrast; >1 folds particles into sheets
+
+const C_AIR = 343;
+
+/* Stratified-jitter rest positions: one particle per cell of a fine grid,
+   randomly placed inside it -- uniform density, no lattice moire. */
+function restPoints(n, inside, box){
+  const [bx, by, bz] = box, vol = 8*bx*by*bz, h = Math.cbrt(vol/(n*1.0));
+  const out = [], rnd = rng(7);
+  for (let z=-bz; z<bz; z+=h) for (let y=-by; y<by; y+=h) for (let x=-bx; x<bx; x+=h){
+    const px = x + rnd()*h, py = y + rnd()*h, pz = z + rnd()*h;
+    if (inside(px, py, pz)) out.push(px, py, pz);
+  }
+  return new Float32Array(out);
+}
+
+/* frame lookup: u in [0,1] across the clip -> two frames + blend */
+function frames(A, u){ const fx = Math.max(0, Math.min(1, u))*(A.NT-1), i = Math.min(A.NT-2, Math.floor(fx)); return [i, fx-i]; }
+
+/* Each moment's pattern is scaled to unit RMS before its loudness is
+   applied (as density-grid-prototype normalised its field by RMS).
+   Otherwise a long-wavelength kick, compressed almost uniformly across
+   the slice, outshines every note -- the same "loudest term swallows
+   detail" failure this project keeps meeting. Loudness (dB) still sets
+   how strongly each moment is drawn. */
+function frameNorms(A, pattern, samples){
+  const norm = new Float32Array(A.NT), o = [0,0,0,0];
+  for (let fi=0; fi<A.NT; fi++){
+    if (A.L[fi] <= 0) continue;
+    let s2 = 0; for (const smp of samples){ pattern(A, fi, smp[0], smp[1], smp[2], o); s2 += o[0]*o[0]; }
+    norm[fi] = 1/Math.max(Math.sqrt(s2/samples.length), 0.05);
+  }
+  return norm;
+}
+function buildCloud(A, rest, pattern, samples, place){
+  const norm = frameNorms(A, pattern, samples);
+  const N = rest.length/3, pos = new Float32Array(rest.length), pr = new Float32Array(N), tu = new Float32Array(N), o = [0,0,0,0];
+  for (let q=0;q<N;q++){
+    const x = rest[3*q], y = rest[3*q+1], z = rest[3*q+2];
+    const [u, a, b, c] = place.coords(x, y, z);
+    const [i, f] = frames(A, u); tu[q] = u;
+    let p = 0, gx = 0, gy = 0, gz = 0;
+    for (const [fi, wt] of [[i, 1-f], [i+1, f]]){
+      const s = A.L[fi]*wt*norm[fi]; if (s <= 0) continue;
+      pattern(A, fi, a, b, c, o); p += s*o[0]; gx += s*o[1]; gy += s*o[2]; gz += s*o[3];
+    }
+    place.move(x, y, z, GAIN*gx, GAIN*gy, GAIN*gz, pos, 3*q); pr[q] = p;
+  }
+  return { pos, pr, tu, A, N };
+}
+
+/* ---------------- COLUMN: vertical = time, slice = real field ---------------- */
+const COL = { R: 22, H: 70, AIR: +(P.get('air') || 5) };   // cylinder radius & height (mm); R mm = AIR m of air
+/* Field in the source plane at (X, Z) metres: p and grad p / k^2.
+   Spreading loss (1/r) is left out so far wavefronts read as clearly as
+   near ones; the interference geometry is unchanged by that. */
+function patternCol(A, fi, X, Z, _, o){
+  const Ns = SRC.length, KMIN = 2.0; let p = 0, dx = 0, dz = 0;
+  for (let c=0;c<K;c++){
+    const w = A.W[fi*K+c]; if (w <= 0) continue;
+    const kw = 2*Math.PI*A.F[fi*K+c]/C_AIR, kk = Math.max(kw, KMIN);
+    for (let s=0;s<Ns;s++){
+      const ex = X - SRC[s][0], ez = Z - SRC[s][2], d = Math.hypot(ex, ez) + 1e-6, ph = kw*d, amp = w/Ns;
+      p += amp*Math.cos(ph);
+      const g = -amp*Math.sin(ph)*kw/(kk*kk);     // xi = grad p / k^2, into compressions
+      dx += g*ex/d; dz += g*ez/d;
+    }
+  }
+  o[0] = p; o[1] = dx; o[2] = 0; o[3] = dz;
+}
+function buildColumn(A, n){
+  const rest = restPoints(n, (x,y,z) => x*x+z*z < COL.R*COL.R, [COL.R, COL.H/2, COL.R]);
+  const SC = COL.R/COL.AIR, CAP = 2.2, samples = [];
+  for (let i=0;i<500;i++){ const r = COL.AIR*Math.sqrt((i+0.5)/500), t = i*2.39996; samples.push([r*Math.cos(t), r*Math.sin(t), 0]); }
+  return withCrowding(buildCloud(A, rest, patternCol, samples, {
+    coords: (x, y, z) => [(y + COL.H/2)/COL.H, x/SC, z/SC, 0],
+    move: (x, y, z, gx, gy, gz, pos, j) => {
+      let mx = gx*SC, mz = gz*SC; const m = Math.hypot(mx, mz); if (m > CAP){ mx *= CAP/m; mz *= CAP/m; }
+      pos[j] = x + mx; pos[j+1] = y; pos[j+2] = z + mz; }
+  }), [COL.R + 3, COL.H/2 + 1, COL.R + 3], (rest.length/3)/(Math.PI*COL.R*COL.R*COL.H), +(P.get('cblo') || 0.6), +(P.get('cbhi') || 0.97));
+}
+
+/* ---------------- SPHERE: radius = time, shell = far-field pattern ---------------- */
+const SPH = { R: 25, CORE: 2.5 };
+/* Far-field pattern in direction u: p and its tangential gradient / (k|s|)^2. */
+function patternSph(A, fi, ux, uy, uz, o){
+  const Ns = SRC.length, KAMIN = 3.0; let p = 0, gx = 0, gy = 0, gz = 0;
+  for (let c=0;c<K;c++){
+    const w = A.W[fi*K+c]; if (w <= 0) continue;
+    const kw = 2*Math.PI*A.F[fi*K+c]/C_AIR;
+    for (let s=0;s<Ns;s++){
+      const [sx, sy, sz] = SRC[s], a2 = sx*sx+sy*sy+sz*sz, dot = ux*sx+uy*sy+uz*sz, ph = kw*dot, amp = w/Ns;
+      p += amp*Math.cos(ph);
+      const ka = Math.max(kw*Math.sqrt(a2), KAMIN), g = -amp*Math.sin(ph)*kw/(ka*ka);
+      gx += g*(sx - dot*ux); gy += g*(sy - dot*uy); gz += g*(sz - dot*uz);
+    }
+  }
+  o[0] = p; o[1] = gx; o[2] = gy; o[3] = gz;
+}
+function sphereSamples(){
+  const samples = [];
+  for (let i=0;i<500;i++){ const y = 1 - 2*(i+0.5)/500, r = Math.sqrt(1-y*y), t = i*2.39996; samples.push([r*Math.cos(t), y, r*Math.sin(t)]); }
+  return samples;
+}
+const SPH_CAP = 0.16;
+function moveTangential(x, y, z, gx, gy, gz, pos, j){
+  const r = Math.hypot(x, y, z); let m = Math.hypot(gx, gy, gz); if (m > SPH_CAP){ gx *= SPH_CAP/m; gy *= SPH_CAP/m; gz *= SPH_CAP/m; }
+  const vx = x/r + gx, vy = y/r + gy, vz = z/r + gz, vl = Math.hypot(vx, vy, vz);
+  pos[j] = vx/vl*r; pos[j+1] = vy/vl*r; pos[j+2] = vz/vl*r;
+}
+/* Sphere variants share everything but the angular pattern and the
+   radius <-> time map:
+   'air'  open air, radius linear in time (the original sphere)
+   'res'  resonant shell: the sound plays inside a rigid spherical room
+   'acc'  accretion: open air, but each moment adds a layer whose
+          thickness in each direction is the energy it sent that way
+   'accres' accretion + resonant shell: the room's wall pattern, with
+          layers as thick as the energy that reached each part of the wall
+   opt (all optional, for res/accres):
+     sharp  low damping -- each note locks into one mode shape
+     tune   room sized from this clip's spectrum, so its notes sit on resonances
+     taper  fade angular orders above ~10 -- less grain
+     onset  brightness follows note onsets, not just loudness
+     stereo sources placed by the recording's stereo image, moment by moment
+     sym    five sources on a ring -- five-fold symmetric patterns
+     box    a rectangular room instead of a spherical one
+     smooth (accretion) outline from the broad energy pattern only
+     events (accretion) layers thicken on note onsets, not sustained sound */
+function buildSphere(A, n, variant = 'air', opt = {}){
+  const box = [SPH.R, SPH.R, SPH.R], rho0 = n/(8*SPH.R**3), cut = [+(P.get('sblo') || 0.05), +(P.get('sbhi') || 0.85)];
+  let pattern = patternSph, uOf = (r) => (SPH.R - r)/(SPH.R - SPH.CORE), acc = null, res = null;
+  if (variant === 'res' || variant === 'accres'){ res = opt.box ? makeBoxPattern(A, opt) : makeResPattern(A, opt); pattern = res.pattern; }
+  if (variant === 'acc') acc = makeAccretion(A, openAirEnergy(A), opt);
+  if (variant === 'accres') acc = makeAccretion(A, res.energy, opt);
+  if (acc) uOf = acc.uOf;
+  const inside = acc ? (x,y,z) => { const r = Math.hypot(x,y,z); return r > SPH.CORE && r < SPH.R && acc.uOf(r, x/r, y/r, z/r) >= 0; }
+                     : (x,y,z) => { const r = Math.hypot(x,y,z); return r < SPH.R && r > SPH.CORE; };
+  const rest = restPoints(n, inside, box);
+  const cloud = buildCloud(A, rest, pattern, sphereSamples(), {
+    coords: (x, y, z) => { const r = Math.hypot(x, y, z), ux = x/r, uy = y/r, uz = z/r; return [uOf(r, ux, uy, uz), ux, uy, uz]; },
+    move: moveTangential
+  });
+  /* onset: brightness = loudness x (0.25 + 0.75 x sqrt onset strength), so
+     attacks read as crisp bright shells and sustained sound recedes;
+     rescaled so the loudest moments keep their brightness (unscaled, nearly
+     everything fell under the engraving cut-off) */
+  if (opt.onset){
+    const lb = A.L.map((l, i) => l*(0.25 + 0.75*Math.sqrt(A.ON[i])));
+    const top = (arr) => Float32Array.from(arr).sort()[Math.floor(arr.length*0.95)] || 1;
+    const k = top(A.L)/Math.max(top(lb), 1e-6);
+    cloud.Lb = lb.map(v => Math.min(1, v*k));
+  }
+  cloud.room = res && res.room;
+  return withCrowding(cloud, [SPH.R + 1, SPH.R + 1, SPH.R + 1], rho0, ...cut);
+}
+
+/* ---------------- option 3: resonant shell ----------------
+   Sources inside a rigid spherical room of radius a. The pressure on the
+   wall from a point source at radius r_s is exactly
+       p(a, Omega) ~ sum_l (2l+1) P_l(cos gamma) j_l(k r_s) / j_l'(k a)
+   (interior Green's function; gamma = angle between Omega and the
+   source). j_l'(ka) = 0 are the room's resonances, where one mode shape
+   takes over -- so every frequency picks its own pattern. 1/j_l' is
+   damped (j'/(j'^2 + eps^2)) as a real room's absorption would. Each
+   shell of the sculpture is the wall pressure at that moment. */
+const RES = { A: +(P.get('ra') || 1.5), RS: 0.6, LMAX: 40, NC: 512, EPS: +(P.get('reps') || 0.05), EPS_SHARP: 0.012, TAPER_L: 10, TUNE_KA: 10 };
+const unit = (v) => { const l = Math.hypot(...v); return v.map(c => c/l); };
+const RES_SRC = [[0.3,0.8,0.5],[-0.7,-0.2,0.6],[0.2,-0.6,-0.75]].map(unit);
+const SYM_SRC = Array.from({length:5}, (_,i) => [Math.cos(i*2*Math.PI/5), 0, Math.sin(i*2*Math.PI/5)]);
+/* source directions for each moment */
+function sourceDirs(A, opt){
+  const base = opt.sym ? SYM_SRC : RES_SRC;
+  if (!opt.stereo || !A.PAN) return () => base;
+  /* pan turns the group about the vertical axis (hard left/right = 80 deg);
+     width spreads the sources apart from their mean direction, narrow
+     images pull them together. Smoothed over ~0.1 s. */
+  const mean = unit(base.reduce((m, d) => [m[0]+d[0], m[1]+d[1], m[2]+d[2]], [0,0,0]).map(c => c + 1e-9));
+  const per = [], sm = (arr, i) => { let s = 0, c = 0; for (let j=Math.max(0,i-5); j<=Math.min(A.NT-1,i+5); j++){ s += arr[j]; c++; } return s/c; };
+  for (let fi=0; fi<A.NT; fi++){
+    const ang = sm(A.PAN, fi)*1.4, spread = 0.25 + 1.5*sm(A.WID, fi), ca = Math.cos(ang), sa = Math.sin(ang);
+    per.push(base.map(d => { const v = unit(d.map((c, i) => mean[i] + (c - mean[i])*spread)); return [ca*v[0] + sa*v[2], v[1], -sa*v[0] + ca*v[2]]; }));
+  }
+  return (fi) => per[fi];
+}
+/* room radius chosen so this clip's typical partial sits at k a = TUNE_KA */
+function tunedRadius(A){
+  const fs = []; let tot = 0;
+  for (let i=0;i<A.NT;i++) for (let c=0;c<K;c++){ const w = A.W[i*K+c]*A.L[i]; if (w > 0){ fs.push([A.F[i*K+c], w]); tot += w; } }
+  fs.sort((a,b) => a[0]-b[0]); let acc = 0, fmed = 300;
+  for (const [f, w] of fs){ acc += w; if (acc >= tot/2){ fmed = f; break; } }
+  return Math.max(0.5, Math.min(6, RES.TUNE_KA*C_AIR/(2*Math.PI*fmed)));
+}
+function sphBessel(x, L){            // j_0..j_{L+1}, Miller's downward recurrence (upward is unstable for l > x)
+  const j = new Float64Array(L+2);
+  if (x < 1e-8){ j[0] = 1; return j; }
+  let jp1 = 0, jc = 1e-30;
+  for (let l = Math.max(L+1, Math.ceil(x)) + 32; l >= 1; l--){
+    if (l <= L+1) j[l] = jc;
+    const jm1 = (2*l+1)/x*jc - jp1; jp1 = jc; jc = jm1;
+    if (Math.abs(jc) > 1e200){ jc *= 1e-200; jp1 *= 1e-200; for (let q=0;q<=L+1;q++) j[q] *= 1e-200; }
+  }
+  j[0] = jc;
+  const j0 = Math.sin(x)/x, j1 = Math.sin(x)/(x*x) - Math.cos(x)/x;
+  const sc = Math.abs(j0) > Math.abs(j1) ? j0/j[0] : j1/j[1];
+  for (let q=0;q<=L+1;q++) j[q] *= sc;
+  return j;
+}
+function makeResPattern(A, opt = {}){
+  const { NC, LMAX: L } = RES, NT = A.NT, ra = opt.tune ? tunedRadius(A) : RES.A, epsBase = opt.sharp ? RES.EPS_SHARP : RES.EPS;
+  const T = new Float32Array(NT*NC), D = new Float32Array(NT*NC), kap2 = new Float32Array(NT);
+  const TP = new Float32Array(NT*K*NC);          // per-partial wall pattern (unweighted), for energy
+  const coefP = Array.from({length:K}, () => new Float64Array(L+1)), coef = new Float64Array(L+1), Pl = new Float64Array(L+1);
+  const taper = new Float64Array(L+1).map((_, l) => opt.taper ? Math.exp(-((l/RES.TAPER_L)**2)) : 1);
+  for (let fi=0; fi<NT; fi++){
+    coef.fill(0);
+    for (let c=0;c<K;c++){
+      coefP[c].fill(0);
+      const w = A.W[fi*K+c]; if (w <= 0) continue;
+      const k = 2*Math.PI*A.F[fi*K+c]/C_AIR, xa = k*ra, jr = sphBessel(xa*RES.RS, L), ja = sphBessel(xa, L);
+      const eps = epsBase/Math.max(1, xa);     // j_l' scales like 1/x, so damp relative to that
+      for (let l=0;l<=L;l++){ const dj = l === 0 ? -ja[1] : ja[l-1] - (l+1)/xa*ja[l];
+        coefP[c][l] = taper[l]*(2*l+1)*jr[l]*dj/(dj*dj + eps*eps); coef[l] += w*coefP[c][l]; }
+    }
+    let num = 0, den = 0;
+    for (let l=0;l<=L;l++){ const e = coef[l]*coef[l]/(2*l+1); num += l*(l+1)*e; den += e; }
+    kap2[fi] = Math.max(9, den > 0 ? num/den : 9);   // typical angular wavenumber^2, for xi = grad p / kappa^2
+    for (let ic=0; ic<NC; ic++){
+      const x = -1 + 2*ic/(NC-1); Pl[0] = 1; Pl[1] = x;
+      for (let l=2;l<=L;l++) Pl[l] = ((2*l-1)*x*Pl[l-1] - (l-1)*Pl[l-2])/l;
+      let sum = 0; for (let l=0;l<=L;l++) sum += coef[l]*Pl[l];
+      T[fi*NC+ic] = sum;
+      for (let c=0;c<K;c++){ if (A.W[fi*K+c] <= 0) continue; let v = 0; const cp = coefP[c]; for (let l=0;l<=L;l++) v += cp[l]*Pl[l]; TP[(fi*K+c)*NC+ic] = v; }
+    }
+    for (let ic=0; ic<NC; ic++){ const a = Math.max(0, ic-1), b = Math.min(NC-1, ic+1);
+      D[fi*NC+ic] = (T[fi*NC+b] - T[fi*NC+a])/((b-a)*2/(NC-1)); }
+  }
+  const dirsAt = sourceDirs(A, opt);
+  const lookup = (arr, base, c) => { const fx = (c+1)/2*(NC-1), i = Math.max(0, Math.min(NC-2, Math.floor(fx))), f = fx - i; return arr[base+i]*(1-f) + arr[base+i+1]*f; };
+  return {
+    room: ra,
+    pattern(A, fi, ux, uy, uz, o){
+      let p = 0, gx = 0, gy = 0, gz = 0; const base = fi*NC, S = dirsAt(fi), Ns = S.length;
+      for (let s=0;s<Ns;s++){
+        const [sx, sy, sz] = S[s], c = ux*sx + uy*sy + uz*sz, t = lookup(T, base, c), d = lookup(D, base, c);
+        p += t/Ns; gx += d*(sx - c*ux)/Ns; gy += d*(sy - c*uy)/Ns; gz += d*(sz - c*uz)/Ns;
+      }
+      o[0] = p; o[1] = gx/kap2[fi]; o[2] = gy/kap2[fi]; o[3] = gz/kap2[fi];
+    },
+    /* energy reaching the wall in direction u: each partial's amplitude
+       squared, summed (different frequencies don't interfere on average) */
+    energy(fi, ux, uy, uz){
+      let e = 0; const S = dirsAt(fi);
+      for (let c=0;c<K;c++){ const w = A.W[fi*K+c]; if (w <= 0) continue; let p = 0;
+        for (const [sx, sy, sz] of S) p += lookup(TP, (fi*K+c)*NC, ux*sx + uy*sy + uz*sz);
+        e += w*p*p; }
+      return e;
+    }
+  };
+}
+
+/* ---------------- option 6: rectangular room ----------------
+   A 3.1 x 2.5 x 3.7 m room with rigid walls. Its modes are
+   cos(n pi x/Lx) cos(m pi y/Ly) cos(q pi z/Lz); a source at x_s drives
+   each mode by psi(x_s) / (k_n^2 - k^2 - i k k_n/Q). Each shell is the
+   field on a 1 m sphere around the room's centre. Modes are summed only
+   near each partial's frequency, and partials above 1 kHz are left out
+   (mode count grows with f^2); the field is computed every 6th moment on
+   a direction grid and interpolated. */
+const BOX = { LX: 3.1, LY: 2.5, LZ: 3.7, Q: 40, RS: 1.0, SRC_R: 0.9, FMAX: 1000, FS: 6, NTH: 33, NPH: 64 };
+function makeBoxPattern(A, opt = {}){
+  const { LX, LY, LZ, Q, NTH, NPH, FS } = BOX, ND = NTH*NPH, NS = Math.ceil(A.NT/FS) + 1, dirsAt = sourceDirs(A, opt);
+  const dirs = [];
+  for (let it=0; it<NTH; it++){ const th = it/(NTH-1)*Math.PI;
+    for (let ip=0; ip<NPH; ip++){ const ph = ip/NPH*2*Math.PI; dirs.push([Math.sin(th)*Math.cos(ph), Math.cos(th), Math.sin(th)*Math.sin(ph)]); } }
+  const kmax = 2*Math.PI*BOX.FMAX/C_AIR*1.2, NX = Math.ceil(kmax*LX/Math.PI) + 2, NY = Math.ceil(kmax*LY/Math.PI) + 2, NZ = Math.ceil(kmax*LZ/Math.PI) + 2;
+  const tab = (N, Lx, axis) => Array.from({length:N}, (_, n) => Float32Array.from(dirs, d => Math.cos(n*Math.PI*(BOX.RS*d[axis] + Lx/2)/Lx)));
+  const CX = tab(NX, LX, 0), CY = tab(NY, LY, 1), CZ = tab(NZ, LZ, 2);
+  const psi = (n, m, q, x) => Math.cos(n*Math.PI*(x[0] + LX/2)/LX)*Math.cos(m*Math.PI*(x[1] + LY/2)/LY)*Math.cos(q*Math.PI*(x[2] + LZ/2)/LZ);
+  const G = new Float32Array(NS*ND);
+  for (let s=0; s<NS; s++){
+    const fi = Math.min(A.NT-1, s*FS), src = dirsAt(fi).map(d => d.map(c => c*BOX.SRC_R)), g = G.subarray(s*ND, (s+1)*ND);
+    for (let c=0;c<K;c++){
+      const w = A.W[fi*K+c], f = A.F[fi*K+c]; if (w <= 0 || f > BOX.FMAX) continue;
+      const k = 2*Math.PI*f/C_AIR, band = Math.max(3*k/Q, 0.6);
+      for (let n=0; n<NX; n++){ const kx = n*Math.PI/LX; if (kx > k + band) break;
+        for (let m=0; m<NY; m++){ const ky = m*Math.PI/LY, hi = (k+band)**2 - kx*kx - ky*ky; if (hi < 0) break;
+          const lo = Math.max(0, (k-band)**2 - kx*kx - ky*ky), q0 = Math.ceil(Math.sqrt(lo)*LZ/Math.PI), q1 = Math.min(NZ-1, Math.floor(Math.sqrt(hi)*LZ/Math.PI));
+          for (let q=q0; q<=q1; q++){
+            const kz = q*Math.PI/LZ, kn2 = kx*kx + ky*ky + kz*kz, den = kn2 - k*k, resp = den/(den*den + (k*Math.sqrt(kn2)/Q)**2);
+            let drive = 0; for (const x of src) drive += psi(n, m, q, x);
+            const amp = w*resp*drive/src.length; if (amp === 0) continue;
+            const cx = CX[n], cy = CY[m], cz = CZ[q];
+            for (let d=0; d<ND; d++) g[d] += amp*cx[d]*cy[d]*cz[d];
+          }
+        }
+      }
+    }
+  }
+  const val = (fi, ux, uy, uz) => {
+    const sx = Math.min(NS-1.001, fi/FS), s0 = Math.floor(sx), fs = sx - s0;
+    const t = Math.acos(Math.max(-1, Math.min(1, uy)))/Math.PI*(NTH-1);
+    let ph = Math.atan2(uz, ux); if (ph < 0) ph += 2*Math.PI; const q = ph/(2*Math.PI)*NPH;
+    const it = Math.min(NTH-2, Math.floor(t)), ft = t - it, ip = Math.floor(q) % NPH, fp = q - Math.floor(q), ip2 = (ip+1) % NPH;
+    const at = (s) => { const b = s*ND; return (1-ft)*((1-fp)*G[b+it*NPH+ip] + fp*G[b+it*NPH+ip2]) + ft*((1-fp)*G[b+(it+1)*NPH+ip] + fp*G[b+(it+1)*NPH+ip2]); };
+    return at(s0)*(1-fs) + at(s0+1)*fs;
+  };
+  // tangential gradient by central differences along two tangent directions; kappa^2 per moment from samples
+  const tang = (ux, uy, uz) => { const a = Math.abs(uy) < 0.9 ? [0,1,0] : [1,0,0];
+    let e1 = [uy*a[2] - uz*a[1], uz*a[0] - ux*a[2], ux*a[1] - uy*a[0]]; e1 = unit(e1);
+    return [e1, [uy*e1[2] - uz*e1[1], uz*e1[0] - ux*e1[2], ux*e1[1] - uy*e1[0]]]; };
+  const H = 0.03, grad = (fi, ux, uy, uz) => { const out = [0,0,0];
+    for (const e of tang(ux, uy, uz)){
+      const pp = unit([ux + H*e[0], uy + H*e[1], uz + H*e[2]]), pm = unit([ux - H*e[0], uy - H*e[1], uz - H*e[2]]);
+      const d = (val(fi, ...pp) - val(fi, ...pm))/(2*H); out[0] += d*e[0]; out[1] += d*e[1]; out[2] += d*e[2]; }
+    return out; };
+  const samples = sphereSamples().filter((_, i) => i % 5 === 0), kap2 = new Float32Array(NS);
+  for (let s=0; s<NS; s++){ const fi = Math.min(A.NT-1, s*FS); let gp = 0, pp = 0;
+    for (const u of samples){ const v = val(fi, ...u), g = grad(fi, ...u); pp += v*v; gp += g[0]*g[0] + g[1]*g[1] + g[2]*g[2]; }
+    kap2[s] = Math.max(9, pp > 0 ? gp/pp : 9); }
+  return {
+    room: 'box',
+    pattern(A, fi, ux, uy, uz, o){ const g = grad(fi, ux, uy, uz), k2 = kap2[Math.min(NS-1, Math.round(fi/FS))];
+      o[0] = val(fi, ux, uy, uz); o[1] = g[0]/k2; o[2] = g[1]/k2; o[3] = g[2]/k2; },
+    energy(fi, ux, uy, uz){ const v = val(fi, ux, uy, uz); return v*v; }
+  };
+}
+
+/* energy the open-air sources send in direction u (time-averaged intensity of the array) */
+function openAirEnergy(A){
+  const Ns = SRC.length;
+  return (fi, ux, uy, uz) => {
+    let e = 0;
+    for (let c=0;c<K;c++){
+      const w = A.W[fi*K+c]; if (w <= 0) continue;
+      const k = 2*Math.PI*A.F[fi*K+c]/C_AIR; let re = 0, im = 0;
+      for (let s=0;s<Ns;s++){ const ph = k*(ux*SRC[s][0] + uy*SRC[s][1] + uz*SRC[s][2]); re += Math.cos(ph); im += Math.sin(ph); }
+      e += w*(re*re + im*im)/(Ns*Ns);
+    }
+    return e;
+  };
+}
+
+/* ---------------- option 4: accretion silhouette ----------------
+   Time still runs inward, but each moment lays down a layer whose
+   thickness in every direction is (a floor + loudness) x the energy sent
+   that way at that moment (normalised to a mean of 1 over directions).
+   Loud passages make thick layers, quiet ones thin; directional passages
+   bulge. Like growth rings, so the outline is the clip's own record.
+   Presentational: the direction ratio is capped at EMAX and softened by
+   EX -- uncapped, the few strongest lobes set the scale and everything
+   else shrank to a small spiky star. Particles are placed uniformly in the
+   final shape, so thick layers are not thinned out.
+   opt.smooth: blur the energy over directions first (~50 deg), so only the
+   broad shape sets the outline. opt.events: thickness from onsets only, so
+   the outline records rhythm and sustained sound adds almost nothing. */
+const ACC = { NTH: 33, NPH: 64, FLOOR: 0.08, LE: 1.5, EX: +(P.get('aex') || 0.5), EMAX: +(P.get('aemax') || 4), SMOOTH_PASSES: 24 };
+function makeAccretion(A, energy, opt = {}){
+  const { NTH, NPH } = ACC, ND = NTH*NPH, NT = A.NT;
+  const dirs = [], sw = [];
+  for (let it=0; it<NTH; it++){ const th = it/(NTH-1)*Math.PI;
+    for (let ip=0; ip<NPH; ip++){ const ph = ip/NPH*2*Math.PI; dirs.push([Math.sin(th)*Math.cos(ph), Math.cos(th), Math.sin(th)*Math.sin(ph)]); sw.push(Math.max(1e-3, Math.sin(th))); } }
+  const th = new Float32Array(ND*NT), E = new Float32Array(ND), tmp = new Float32Array(ND);
+  const blur = () => { for (let pass=0; pass<ACC.SMOOTH_PASSES; pass++){
+      for (let it=0; it<NTH; it++) for (let ip=0; ip<NPH; ip++){ const d = it*NPH+ip; tmp[d] = 0.25*E[it*NPH+(ip+NPH-1)%NPH] + 0.5*E[d] + 0.25*E[it*NPH+(ip+1)%NPH]; }
+      for (let it=0; it<NTH; it++) for (let ip=0; ip<NPH; ip++){ const d = it*NPH+ip, a = Math.max(0, it-1), b = Math.min(NTH-1, it+1); E[d] = 0.25*tmp[a*NPH+ip] + 0.5*tmp[d] + 0.25*tmp[b*NPH+ip]; } } };
+  for (let fi=0; fi<NT; fi++){
+    let mean = 0, wsum = 0;
+    for (let d=0; d<ND; d++) E[d] = energy(fi, dirs[d][0], dirs[d][1], dirs[d][2]);
+    if (opt.smooth) blur();
+    for (let d=0; d<ND; d++){ mean += E[d]*sw[d]; wsum += sw[d]; }
+    mean /= wsum;
+    const loud = opt.events ? ACC.FLOOR + 2.5*Math.pow(A.ON[fi], 0.7)*A.L[fi] : ACC.FLOOR + Math.pow(A.L[fi], ACC.LE);
+    for (let d=0; d<ND; d++) th[d*NT+fi] = loud*Math.pow(mean > 0 ? Math.min(ACC.EMAX, E[d]/mean) : 1, ACC.EX);
+  }
+  // C[d][i] = thickness laid down from moment i to the end (the centre)
+  const C = new Float32Array(ND*NT), outer = [];
+  for (let d=0; d<ND; d++){
+    const o = d*NT; C[o+NT-1] = 0;
+    for (let i=NT-2; i>=0; i--) C[o+i] = C[o+i+1] + 0.5*(th[o+i] + th[o+i+1])/(NT-1);
+    outer.push(C[o]);
+  }
+  /* Soft scale: x = C / median outer thickness, radius ~ x/(1+x^3)^(1/3).
+     A typical direction reaches ~80% of the radius and the strongest ones
+     approach the edge without running away. Scaling by the maximum let a
+     few lobes shrink the whole shape to half size. Monotonic, so layers
+     keep their order. */
+  outer.sort((a,b) => a-b);
+  const cref = outer[Math.floor(outer.length/2)] || 1, soft = (c) => { const x = c/cref; return x/Math.cbrt(1 + x*x*x); };
+  /* inverse: radius r in direction u -> moment u in [0,1], or -1 outside */
+  function uOf(r, ux, uy, uz){
+    const t = Math.acos(Math.max(-1, Math.min(1, uy)))/Math.PI*(NTH-1);
+    let ph = Math.atan2(uz, ux); if (ph < 0) ph += 2*Math.PI; const q = ph/(2*Math.PI)*NPH;
+    const it = Math.min(NTH-2, Math.floor(t)), ft = t - it, ip = Math.floor(q) % NPH, fp = q - Math.floor(q), ip2 = (ip+1) % NPH;
+    const ds = [it*NPH+ip, it*NPH+ip2, (it+1)*NPH+ip, (it+1)*NPH+ip2], ws = [(1-ft)*(1-fp), (1-ft)*fp, ft*(1-fp), ft*fp];
+    const R = (i) => SPH.CORE + (SPH.R - SPH.CORE)*soft(ws[0]*C[ds[0]*NT+i] + ws[1]*C[ds[1]*NT+i] + ws[2]*C[ds[2]*NT+i] + ws[3]*C[ds[3]*NT+i]);
+    if (r > R(0)) return -1;
+    let lo = 0, hi = NT-1;                          // R decreases with i
+    while (hi - lo > 1){ const mid = (lo + hi) >> 1; if (R(mid) >= r) lo = mid; else hi = mid; }
+    const r0 = R(lo), r1 = R(hi), f = r0 > r1 ? (r0 - r)/(r0 - r1) : 0;
+    return (lo + Math.max(0, Math.min(1, f)))/(NT-1);
+  }
+  return { uOf };
+}
+
+/* ---------------- crowding: brightness from the medium itself ----------------
+   Brightness used to be each particle's own pressure value. Where
+   particles have folded past each other, neighbours carry very different
+   values, and the result read as static. Instead, measure how crowded the
+   medium actually is around each particle -- particles splatted into a
+   0.6 mm grid, blurred to ~1 mm -- relative to the undisturbed density.
+   That is the density grid's own readout (crowding = compression), and
+   it is smooth by construction. */
+/* percentiles of the brightness field */
+const LOUD_EXP = +(P.get('le') || 0.8);
+const ENG_LO = +(P.get('elo') || 0.45), ENG_HI = +(P.get('ehi') || 0.85);
+const CROWD_H = 0.6, PRESS_H = +(P.get('ph') || 0.4);
+/* which field drives brightness and engraving: smoothed pressure (default) or crowding */
+const FIELD = P.get('field') === 'crowd' ? 'ex' : 'ps';
+function withCrowding(cloud, ext, rho0, bLo, bHi){
+  cloud.ex = smoothOnGrid(cloud, ext, rho0, CROWD_H, 2, null);
+  cloud.ps = smoothOnGrid(cloud, ext, rho0, PRESS_H, 1, cloud.pr);
+  /* Brightness 0..1 is set moment by moment. Each moment (a thin layer of
+     the time axis) keeps only its own strongest compressions -- a cut-off
+     taken from that layer's own distribution -- then is scaled by how loud
+     the moment was. (Column: each moment's top 40%, full brightness only
+     at its top 3%. Sphere: nearly the whole shell, full brightness from
+     its 70th percentile up. A sphere shell's pattern is mostly one broad
+     always-in-phase lobe; scaled to that lobe, the rest of every shell --
+     the rings that show time -- went dark.) A single global cut-off let one always-in-phase
+     direction take every top value and wiped out the quieter beats. Layers
+     with almost no spread (a uniformly compressed long-wavelength boom)
+     get little brightness rather than having noise promoted to structure. */
+  const f = cloud[FIELD], N = cloud.N, A = cloud.A, NBIN = 240, bins = Array.from({length:NBIN}, () => []);
+  for (let q=0;q<N;q++) bins[Math.min(NBIN-1, Math.floor(cloud.tu[q]*NBIN))].push(f[q]);
+  const lo = new Float32Array(NBIN), hi = new Float32Array(NBIN), spreads = [];
+  for (let b=0;b<NBIN;b++){ const v = Float32Array.from(bins[b]).sort(); if (!v.length) continue;
+    const pct = (x) => v[Math.min(v.length-1, Math.floor(x*v.length))]; lo[b] = pct(bLo); hi[b] = pct(bHi); spreads.push(hi[b] - lo[b]); }
+  spreads.sort((a,b) => a-b); const minSpread = 0.5*(spreads[Math.floor(spreads.length/2)] || 1);
+  cloud.br = new Float32Array(N);
+  for (let q=0;q<N;q++){ const u = cloud.tu[q], b = Math.min(NBIN-1, Math.floor(u*NBIN)), [i, t] = frames(A, u);
+    const LL = cloud.Lb || A.L, loud = LL[i]*(1-t) + LL[i+1]*t;
+    cloud.br[q] = Math.max(0, Math.min(1, (f[q] - lo[b])/Math.max(hi[b] - lo[b], minSpread)))*Math.pow(loud, LOUD_EXP); }
+  return cloud;
+}
+/* Splat particles (or particle pressure) to a grid, blur, read back per
+   particle. With val null: crowding (density/rest - 1). With val: the
+   pressure averaged over the particles that ended up nearby. */
+function smoothOnGrid(cloud, ext, rho0, h, passes, val){
+  const { pos, N } = cloud, [bx, by, bz] = ext;
+  const nx = Math.ceil(2*bx/h) + 2, ny = Math.ceil(2*by/h) + 2, nz = Math.ceil(2*bz/h) + 2, nxy = nx*ny;
+  let G = new Float32Array(nx*ny*nz), Wg = val ? new Float32Array(nx*ny*nz) : null;
+  const cell = (q) => { const fx = (pos[3*q]+bx)/h, fy = (pos[3*q+1]+by)/h, fz = (pos[3*q+2]+bz)/h;
+    const i = Math.max(0, Math.min(nx-2, Math.floor(fx))), j = Math.max(0, Math.min(ny-2, Math.floor(fy))), k = Math.max(0, Math.min(nz-2, Math.floor(fz)));
+    return [i, j, k, Math.max(0, Math.min(1, fx-i)), Math.max(0, Math.min(1, fy-j)), Math.max(0, Math.min(1, fz-k))]; };
+  const splat = (Gr, q, a) => { const [i,j,k,u,v,w] = cell(q), o = i + nx*j + nxy*k;   // cloud-in-cell splat
+    Gr[o] += a*(1-u)*(1-v)*(1-w); Gr[o+1] += a*u*(1-v)*(1-w); Gr[o+nx] += a*(1-u)*v*(1-w); Gr[o+nx+1] += a*u*v*(1-w);
+    Gr[o+nxy] += a*(1-u)*(1-v)*w; Gr[o+nxy+1] += a*u*(1-v)*w; Gr[o+nxy+nx] += a*(1-u)*v*w; Gr[o+nxy+nx+1] += a*u*v*w; };
+  for (let q=0;q<N;q++){ splat(G, q, val ? val[q] : 1); if (val) splat(Wg, q, 1); }
+  // two passes of a [1 4 6 4 1]/16 blur along each axis
+  const T = new Float32Array(G.length), kern = [1/16, 4/16, 6/16, 4/16, 1/16];
+  const blur = (src, dst, stride, n) => { dst.fill(0);
+    for (let o=0;o<src.length;o++){ const c = Math.floor(o/stride) % n;
+      for (let t=-2;t<=2;t++){ const cc = c+t; if (cc < 0 || cc >= n) continue; dst[o] += kern[t+2]*src[o + t*stride]; } } };
+  for (const Gr of val ? [G, Wg] : [G])
+    for (let pass=0; pass<passes; pass++){ blur(Gr, T, 1, nx); blur(T, Gr, nx, ny); blur(Gr, T, nxy, nz); Gr.set(T); }
+  const ref = rho0*h*h*h, out = new Float32Array(N);
+  const read = (Gr, o, u, v, w) => (1-w)*((1-v)*((1-u)*Gr[o] + u*Gr[o+1]) + v*((1-u)*Gr[o+nx] + u*Gr[o+nx+1]))
+            +    w*((1-v)*((1-u)*Gr[o+nxy] + u*Gr[o+nxy+1]) + v*((1-u)*Gr[o+nxy+nx] + u*Gr[o+nxy+nx+1]));
+  for (let q=0;q<N;q++){ const [i,j,k,u,v,w] = cell(q), o = i + nx*j + nxy*k;
+    out[q] = val ? read(G, o, u, v, w)/Math.max(read(Wg, o, u, v, w), 1e-6) : read(G, o, u, v, w)/ref - 1; }
+  return out;
+}
+
+/* ---------------- engraving: keep particles where the medium is crowded ----------------
+   A soft threshold on crowding, not a weighted lottery: the lottery
+   scattered lone points through every faintly compressed region. Then
+   drop any point with too few engraved neighbours within ~1 mm. */
+const ENG_MIN = +(P.get('emin') || 8);
+function engrave(cloud, target, opt = {}){
+  const { pos, N } = cloud, ex = cloud.br, rnd = rng(99);
+  const sm = (e) => { const t = Math.max(0, Math.min(1, (e - ENG_LO)/(ENG_HI - ENG_LO))); return t*t*(3 - 2*t); };
+  let sum = 0; for (let q=0;q<N;q++) sum += sm(ex[q]);
+  const g = Math.min(1, target/Math.max(sum, 1));
+  /* opt.finish: two densities and a depth gradient -- the strongest
+     compressions engraved in full, the rest at a quarter, and everything
+     denser toward the core (lasers can vary dot density, so it's printable) */
+  const finish = (q) => { if (!opt.finish) return 1;
+    const r = Math.hypot(pos[3*q], pos[3*q+1], pos[3*q+2])/SPH.R;
+    return (ex[q] > 0.9 ? 1 : 0.25)*(1.3 - 0.7*r); };
+  const keep = []; for (let q=0;q<N;q++) if (rnd() < sm(ex[q])*g*finish(q)) keep.push(q);
+  // isolated-point removal on a 1 mm hash grid (27-cell neighbourhood)
+  const H = 1.0, key = (q) => Math.floor(pos[3*q]/H + 512) + 1024*(Math.floor(pos[3*q+1]/H + 512) + 1024*Math.floor(pos[3*q+2]/H + 512));
+  const cnt = new Map(); for (const q of keep){ const k = key(q); cnt.set(k, (cnt.get(k) || 0) + 1); }
+  const out = [];
+  for (const q of keep){ const k = key(q); let n = 0;
+    for (let dz=-1;dz<=1;dz++) for (let dy=-1;dy<=1;dy++) for (let dx=-1;dx<=1;dx++) n += cnt.get(k + dx + 1024*(dy + 1024*dz)) || 0;
+    if (n > ENG_MIN) out.push(pos[3*q], pos[3*q+1], pos[3*q+2]); }
+  return new Float32Array(out);
+}
+
+/* ---------------- rendering ---------------- */
+const CELL = 760;
+const renderer = new THREE.WebGLRenderer({ antialias:true, preserveDrawingBuffer:true });
+renderer.setPixelRatio(1); renderer.setSize(CELL, CELL);
+renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.0;
+const envTex = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
+const camera = new THREE.PerspectiveCamera(30, 1, 1, 2000);
+
+/* The density-grid look: additive sprites, compression glows, rarefaction
+   stays black, then bloom. Same intensity curve as density-grid-prototype. */
+function glowMaterial(size, bright){
+  return new THREE.ShaderMaterial({
+    uniforms: { uSize:{ value:size }, uScale:{ value: CELL/(2*Math.tan(15*Math.PI/180)) }, uBright:{ value:bright } },
+    /* aP is the per-moment brightness (0 below each moment's cut-off), so
+       the faint haze of barely-compressed medium stays black. */
+    vertexShader: `attribute float aP; uniform float uSize, uScale; varying float vI;
+      void main(){ vec4 mv = modelViewMatrix*vec4(position,1.0); gl_Position = projectionMatrix*mv;
+        vI = pow(aP, 1.5); gl_PointSize = max(1.0, uSize*uScale/max(-mv.z, 1.0)); }`,
+    fragmentShader: `uniform float uBright; varying float vI;
+      void main(){ float d = length(gl_PointCoord-0.5); if (d > 0.5) discard; float sp = smoothstep(0.5, 0.0, d);
+        vec3 col = mix(vec3(0.05,0.20,0.34), vec3(0.62,0.97,1.0), clamp(vI,0.0,1.0));
+        gl_FragColor = vec4(col*vI*uBright*sp, 1.0); }`,
+    blending: THREE.AdditiveBlending, depthTest:false, depthWrite:false, transparent:true
+  });
+}
+function glowShot(cloud, keep, camPos, size, bright){
+  const g = new THREE.BufferGeometry();
+  let pos = cloud.pos, pr = cloud.br;
+  if (keep){ const P2 = [], R2 = []; for (let q=0;q<cloud.N;q++) if (keep(pos[3*q], pos[3*q+1], pos[3*q+2])){ P2.push(pos[3*q], pos[3*q+1], pos[3*q+2]); R2.push(pr[q]); }
+    pos = new Float32Array(P2); pr = new Float32Array(R2); }
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3)); g.setAttribute('aP', new THREE.BufferAttribute(pr, 1));
+  const scene = new THREE.Scene(); scene.background = new THREE.Color(0x020304);
+  scene.add(new THREE.Points(g, glowMaterial(size, bright)));
+  camera.position.set(...camPos); camera.lookAt(0,0,0);
+  const comp = new EffectComposer(renderer); comp.setSize(CELL, CELL);
+  comp.addPass(new RenderPass(scene, camera));
+  comp.addPass(new UnrealBloomPass(new THREE.Vector2(CELL, CELL), 0.8, 0.45, 0.0));
+  comp.addPass(new OutputPass());
+  comp.render(); g.dispose();
+  return renderer.domElement;
+}
+function gradientTex(top, bottom){
+  const c = document.createElement('canvas'); c.width = 4; c.height = 256; const g = c.getContext('2d');
+  const gr = g.createLinearGradient(0,0,0,256); gr.addColorStop(0, top); gr.addColorStop(1, bottom); g.fillStyle = gr; g.fillRect(0,0,4,256);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+}
+const bgCrystal = gradientTex('#202329', '#060708');
+function crystalShot(pts, block, lift, camPos, ptSize){
+  const scene = new THREE.Scene(); scene.background = bgCrystal; scene.environment = envTex; scene.environmentIntensity = 0.6;
+  const [bw, bh, bd] = block;
+  const glass = new THREE.Mesh(new THREE.BoxGeometry(bw, bh, bd), new THREE.MeshPhysicalMaterial({ color:0xffffff, transmission:1, roughness:0.02,
+    thickness:bw, ior:1.5, attenuationColor:new THREE.Color(0xe6f3fb), attenuationDistance:400, specularIntensity:1 }));
+  scene.add(glass);
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(pts, 3));
+  /* Each engraved fracture is ~0.05-0.1 mm, smaller than a pixel here, so
+     opaque 1-px dots overstate it badly (every block read as solid white).
+     Draw them additive and faint, on top of the glass, so overlapping
+     fractures build up brightness the way they scatter light. */
+  const cloud = new THREE.Points(g, new THREE.PointsMaterial({ color:0xeef6ff, size:ptSize, sizeAttenuation:true, transparent:true,
+    opacity:+(P.get('po') || 0.45), blending:THREE.AdditiveBlending, depthTest:false, depthWrite:false }));
+  cloud.position.y = lift; cloud.renderOrder = 10; scene.add(cloud);
+  const base = new THREE.Mesh(new THREE.BoxGeometry(bw+10, 10, bd+10), new THREE.MeshStandardMaterial({ color:0x111214, roughness:0.4 }));
+  base.position.y = -bh/2 - 5; scene.add(base);
+  const led = new THREE.PointLight(0xdfefff, 3000, 140); led.position.set(0, -bh/2 + 2, 0); scene.add(led);
+  const key = new THREE.DirectionalLight(0xffffff, 1.0); key.position.set(60, 90, 70); scene.add(key);
+  camera.position.set(...camPos); camera.lookAt(0, -4, 0);
+  renderer.render(scene, camera); g.dispose();
+  return renderer.domElement;
+}
+
+const out = document.getElementById('out');
+const LABEL_H = 54;
+const og = out.getContext('2d');
+function layout(cols, rows){ out.width = CELL*cols; out.height = (CELL + LABEL_H)*rows; og.fillStyle = '#0b0c0f'; og.fillRect(0,0,out.width,out.height); }
+const SPHERE_LABEL = { air: 'open air', res: 'resonant shell', acc: 'accretion (open air)', accres: 'accretion + resonant shell' };
+const SPHERE_SUB = {
+  air: '12-driver source in open air · outer = start',
+  res: 'inside a rigid spherical room 3 m across · 3 sources',
+  acc: 'each moment adds a layer as thick as the energy it sent',
+  accres: 'resonant room, layers as thick as the energy on its wall'
+};
+function place(canvas, col, row, title, sub){
+  const y = row*(CELL + LABEL_H);
+  og.drawImage(canvas, col*CELL, y + LABEL_H);
+  og.fillStyle = '#0b0c0f'; og.fillRect(col*CELL, y, CELL, LABEL_H);
+  og.fillStyle = '#e7e9ee'; og.font = '600 24px system-ui'; og.fillText(title, col*CELL + 18, y + 26);
+  og.fillStyle = '#8b91a0'; og.font = '18px system-ui'; og.fillText(sub, col*CELL + 18, y + 48);
+}
+
+const engraved = {};
+let lastClip = null;
+async function run(clip){
+  window.__done = false; lastClip = clip;
+  layout(3, 2);
+  const mode = document.getElementById('sphereMode').value;
+  say('analysing ' + clip.name + '…'); await tick();
+  const A = analyse(clip); window.__A = A;
+  const NP = +(P.get('n') || 700000), TARGET = +(P.get('pts') || 200000);
+  const dur = A.T.toFixed(1) + ' s', SZ = +(P.get('sz') || 0.45), BR = +(P.get('br') || 0.012);
+
+  say('building column…'); await tick();
+  let t0 = performance.now();
+  const col = buildColumn(A, NP); window.__col = col;
+  console.log('column', col.N, ((performance.now()-t0)/1000).toFixed(1)+'s');
+  place(glowShot(col, null, [112, 42, 112], SZ, BR), 0, 0, 'Column · time runs upward', clip.name + ' · ' + dur + ' · ' + PRESETS[PRESET].label);
+  place(glowShot(col, (x,y,z) => Math.abs(z) < 1.6, [0, 0, 225], SZ, BR*2.5), 1, 0, 'Column · centre slice', 'side view: across = ' + 2*COL.AIR + ' m of air, up = time');
+  engraved.col = engrave(col, TARGET);
+  place(crystalShot(engraved.col, [50, 80, 50], 0, [140, 40, 200], 0.075), 2, 0, 'Column · laser-engraved glass', (engraved.col.length/3/1000).toFixed(0) + 'k points · 50 × 50 × 80 mm block');
+  await tick();
+
+  say('building sphere…'); await tick();
+  t0 = performance.now();
+  const sph = buildSphere(A, NP, mode); window.__sph = sph;
+  console.log('sphere', mode, sph.N, ((performance.now()-t0)/1000).toFixed(1)+'s');
+  place(glowShot(sph, (x,y,z) => z < 0.5, [62, 48, 112], SZ, BR*1.4), 0, 1, 'Sphere (' + SPHERE_LABEL[mode] + ') · cut open', SPHERE_SUB[mode]);
+  place(glowShot(sph, (x,y,z) => Math.abs(z) < 1.6, [0, 0, 175], SZ, BR*2.5), 1, 1, 'Sphere · centre slice', 'cut through the middle: rings are moments');
+  engraved.sph = engrave(sph, +(P.get('spts') || 90000));
+  place(crystalShot(engraved.sph, [60, 60, 60], 0, [130, 50, 180], 0.075), 2, 1, 'Sphere · laser-engraved glass', (engraved.sph.length/3/1000).toFixed(0) + 'k points · 60 mm cube');
+  say('done — ' + clip.name);
+  window.__done = true;
+}
+
+async function decode(arrayBuf, name, t0in, t1in){
+  const ctx = new OfflineAudioContext(1, 1, 44100);
+  const buf = await ctx.decodeAudioData(arrayBuf);
+  const trimmed = t0in != null || t1in != null;
+  const t0 = +(t0in || 0), t1 = +(t1in || buf.duration);
+  const a = Math.floor(Math.max(0, t0)*buf.sampleRate), b = Math.min(buf.length, Math.floor(t1*buf.sampleRate));
+  const x = new Float32Array(Math.max(1, b - a));
+  for (let c=0;c<buf.numberOfChannels;c++){ const d = buf.getChannelData(c); for (let i=0;i<x.length;i++) x[i] += d[a+i]/buf.numberOfChannels; }
+  const stereo = buf.numberOfChannels >= 2 ? { xL: buf.getChannelData(0).slice(a, a + x.length), xR: buf.getChannelData(1).slice(a, a + x.length) } : {};
+  return { x, sr: buf.sampleRate, ...stereo, name: name + (trimmed ? ' (' + t0 + '–' + t1.toFixed(1) + ' s)' : '') };
+}
+const fetchClip = async (url, t0, t1) => decode(await (await fetch(url)).arrayBuffer(), url.split('/').pop(), t0, t1);
+
+/* ?compare=1 -- every sphere variant for several clips side by side:
+   columns = variants; per clip an engraved-glass row and a slice row. */
+async function runCompare(){
+  window.__done = false;
+  const sounds = [
+    () => synthClip(),
+    () => fetchClip('../local-samples/om.mp3'),
+    () => fetchClip('../local-samples/bluff.mp3', 30, 38)
+  ];
+  const variants = ['air', 'res', 'acc', 'accres'], NP = +(P.get('n') || 500000), SZ = +(P.get('sz') || 0.45), BR = +(P.get('br') || 0.012);
+  layout(variants.length, sounds.length*2);          // per clip: a glass row, then a slice row
+  for (let ci=0; ci<sounds.length; ci++){
+    const clip = await sounds[ci]();
+    say('analysing ' + clip.name + '…'); await tick();
+    const A = analyse(clip);
+    for (let v=0; v<variants.length; v++){
+      const mode = variants[v];
+      say(clip.name + ' · ' + SPHERE_LABEL[mode] + '…'); await tick();
+      const t0 = performance.now(), sph = buildSphere(A, NP, mode);
+      console.log(clip.name, mode, ((performance.now()-t0)/1000).toFixed(1)+'s');
+      const pts = engrave(sph, +(P.get('spts') || 90000));
+      place(crystalShot(pts, [60, 60, 60], 0, [130, 50, 180], 0.075), v, 2*ci, SPHERE_LABEL[mode], clip.name + ' · ' + (pts.length/3/1000).toFixed(0) + 'k points');
+      place(glowShot(sph, (x,y,z) => Math.abs(z) < 1.6, [0, 0, 175], SZ, BR*2.5), v, 2*ci+1, SPHERE_LABEL[mode] + ' · centre slice', clip.name);
+      await tick();
+    }
+  }
+  say('done — sphere comparison');
+  window.__done = true;
+}
+
+/* ?examples=1 -- each proposed refinement of the resonant shell and the
+   combo, applied one at a time to the same clip, as engraved glass. */
+async function runExamples(){
+  window.__done = false;
+  const clip = P.get('synth') ? synthClip() : P.get('file') ? await fetchClip(P.get('file'), P.get('t0'), P.get('t1')) : await fetchClip('../local-samples/bluff.mp3', 30, 38);
+  say('analysing ' + clip.name + '…'); await tick();
+  const A = analyse(clip), NP = +(P.get('n') || 500000), SZ = +(P.get('sz') || 0.45), BR = +(P.get('br') || 0.012);
+  const cells = [
+    ['res',    {},                                  'Resonant shell · as now'],
+    ['res',    { sharp:1, tune:1 },                 '1 · sharper resonances, tuned room'],
+    ['res',    { taper:1 },                         '2 · fine detail limited'],
+    ['res',    { sharp:1, tune:1, taper:1 },        '1 + 2'],
+    ['res',    { onset:1 },                         '3 · onsets emphasised'],
+    ['res',    { stereo:1 },                        '4 · sources from the stereo image'],
+    ['res',    { sym:1 },                           '5 · five-fold symmetric sources'],
+    ['res',    { box:1 },                           '6 · rectangular room'],
+    ['accres', {},                                  'Combo · as now'],
+    ['accres', { smooth:1 },                        '7 · smooth outline'],
+    ['accres', { events:1 },                        '8 · layers grow on onsets'],
+    ['accres', { smooth:1, events:1 },              '7 + 8'],
+    ['res',    {},                                  '9 · engraving finish', { finish:1 }],
+    ['res',    { sharp:1, tune:1, taper:1, onset:1 }, 'Bundle · resonant (1 + 2 + 3)'],
+    ['accres', { sharp:1, tune:1, taper:1, smooth:1, events:1 }, 'Bundle · combo (1 + 2 + 7 + 8)'],
+    ['accres', { sharp:1, tune:1, taper:1, smooth:1, events:1 }, 'Bundle · combo, centre slice', null, 'slice']
+  ];
+  layout(4, 4);
+  const cache = new Map();
+  for (let i=0; i<cells.length; i++){
+    const [variant, opt, title, engOpt, view] = cells[i], key = variant + JSON.stringify(opt);
+    say(title + '…'); await tick();
+    const t0 = performance.now();
+    if (!cache.has(key)) cache.set(key, buildSphere(A, NP, variant, opt));
+    const sph = cache.get(key);
+    console.log(title, ((performance.now()-t0)/1000).toFixed(1)+'s');
+    const room = typeof sph.room === 'number' ? 'room ' + (2*sph.room).toFixed(1) + ' m across' : sph.room === 'box' ? 'room 3.1 × 2.5 × 3.7 m' : 'open air';
+    if (view === 'slice'){ place(glowShot(sph, (x,y,z) => Math.abs(z) < 1.6, [0, 0, 175], SZ, BR*2.5), i % 4, Math.floor(i/4), title, clip.name + ' · ' + room); }
+    else {
+      const pts = engrave(sph, +(P.get('spts') || 90000), engOpt || {});
+      place(crystalShot(pts, [60, 60, 60], 0, [130, 50, 180], 0.075), i % 4, Math.floor(i/4), title, (pts.length/3/1000).toFixed(0) + 'k points · ' + room);
+    }
+    await tick();
+  }
+  say('done — refinement examples · ' + clip.name);
+  window.__done = true;
+}
+
+/* ?bluff=1 -- the dense-mix fixes (analysis options hpss / seg / dyn) on
+   Bluff, in the two looks picked so far: the rectangular room and the
+   combo with layers on onsets. Last row: the whole song. */
+async function runDenseMix(){
+  window.__done = false;
+  const NP = +(P.get('n') || 500000), SZ = +(P.get('sz') || 0.45), BR = +(P.get('br') || 0.012);
+  const LOOKS = { box: ['res', { box:1 }, 'box room'], onset: ['accres', { events:1 }, 'layers on onsets'] };
+  const ALL = { hpss:1, seg:1, dyn:1 };
+  const cells = [
+    ['box',   {},                'Box room · as now'],
+    ['box',   { hpss:1 },        'A · drums split from harmony'],
+    ['box',   { seg:1 },         'C · one shape per beat'],
+    ['box',   { dyn:1 },         'D · clip’s own loudness range'],
+    ['onset', {},                'Layers on onsets · as now'],
+    ['onset', { hpss:1 },        'A · drums split from harmony'],
+    ['onset', { seg:1 },         'C · one shape per beat'],
+    ['onset', { dyn:1 },         'D · clip’s own loudness range'],
+    ['box',   ALL,               'A + C + D · box room'],
+    ['onset', ALL,               'A + C + D · layers on onsets'],
+    ['box',   ALL,               'A + C + D · box room, slice', 'slice'],
+    ['onset', ALL,               'A + C + D · onsets, slice', 'slice'],
+    ['box',   ALL,               'Whole song · box room', null, 'song'],
+    ['onset', ALL,               'Whole song · layers on onsets', null, 'song'],
+    ['box',   ALL,               'Whole song · box room, slice', 'slice', 'song'],
+    ['onset', ALL,               'Whole song · onsets, slice', 'slice', 'song']
+  ];
+  layout(4, 4);
+  const clips = {}, analyses = new Map(), clouds = new Map();
+  for (let i=0; i<cells.length; i++){
+    const [look, aopt, title, view, which = 'excerpt'] = cells[i], [variant, opt, lookName] = LOOKS[look];
+    if (!clips[which]) clips[which] = which === 'song' ? await fetchClip('../local-samples/bluff.mp3') : await fetchClip('../local-samples/bluff.mp3', 30, 38);
+    const clip = clips[which], akey = which + JSON.stringify(aopt);
+    say(title + '…'); await tick();
+    if (!analyses.has(akey)) analyses.set(akey, analyse(clip, which === 'song' ? { ...aopt, maxNT: 1200 } : aopt));
+    const A = analyses.get(akey), ckey = akey + variant + JSON.stringify(opt);
+    const t0 = performance.now();
+    if (!clouds.has(ckey)) clouds.set(ckey, buildSphere(A, NP, variant, opt));
+    const sph = clouds.get(ckey);
+    console.log(title, ((performance.now()-t0)/1000).toFixed(1)+'s', A.SEG ? (A.SEG[A.NT-1] + 1) + ' segments' : '');
+    const sub = clip.name + (A.SEG ? ' · ' + (A.SEG[A.NT-1] + 1) + ' beats' : '');
+    if (view === 'slice') place(glowShot(sph, (x,y,z) => Math.abs(z) < 1.6, [0, 0, 175], SZ, BR*2.5), i % 4, Math.floor(i/4), title, sub);
+    else { const pts = engrave(sph, +(P.get('spts') || 90000));
+      place(crystalShot(pts, [60, 60, 60], 0, [130, 50, 180], 0.075), i % 4, Math.floor(i/4), title, (pts.length/3/1000).toFixed(0) + 'k points · ' + sub); }
+    await tick();
+  }
+  say('done — dense-mix fixes on Bluff');
+  window.__done = true;
+}
+
+(async () => {
+  if (P.get('sphere') && SPHERE_LABEL[P.get('sphere')]) document.getElementById('sphereMode').value = P.get('sphere');
+  if (P.get('bluff')) return runDenseMix();
+  if (P.get('compare')) return runCompare();
+  if (P.get('examples')) return runExamples();
+  const url = P.get('file');
+  await run(url ? await fetchClip(url, P.get('t0'), P.get('t1')) : synthClip());
+})().catch(e => { say('error: ' + e.message); console.error(e); });
+document.getElementById('sphereMode').onchange = () => { if (lastClip) run(lastClip).catch(e => { say('error: ' + e.message); console.error(e); }); };
+
+document.getElementById('file').onchange = async (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  try {
+    say('decoding ' + f.name + '…');
+    await run(await decode(await f.arrayBuffer(), f.name));
+  } catch (err){ say('could not read that file: ' + err.message); }
+};
+document.querySelectorAll('button[data-xyz]').forEach(b => b.onclick = () => {
+  const pts = engraved[b.dataset.xyz]; if (!pts) return;
+  let s = ''; for (let i=0;i<pts.length;i+=3) s += pts[i].toFixed(3) + ' ' + pts[i+1].toFixed(3) + ' ' + pts[i+2].toFixed(3) + '\n';
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([s], { type:'text/plain' }));
+  a.download = 'density-' + b.dataset.xyz + '.xyz'; a.click();
+});
+window.__cap = (w, q) => { const s = Math.min(1, (w||2400)/out.width); const c = document.createElement('canvas');
+  c.width = Math.round(out.width*s); c.height = Math.round(out.height*s); c.getContext('2d').drawImage(out,0,0,c.width,c.height);
+  return c.toDataURL('image/jpeg', q || 0.88); };
+</script>
+</body>
+</html>
